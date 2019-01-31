@@ -1,0 +1,122 @@
+name: "hive-streaming-example-avro-scheme"
+config:
+  topology.workers: 1
+  # decorator being used for the spout to register the StockAvroSerializer.class with Kryo
+  topology.kryo.decorators:
+    - "storm_hive_streaming_example.serializer.StockAvroKryoDecorator"
+  # define serializers being used by tuples de-/serializing values. See http://storm.apache.org/documentation/Serialization.html
+  topology.kryo.register:
+    - storm_hive_streaming_example.model.Stock: storm_hive_streaming_example.serializer.StockAvroSerializer
+  
+components:
+  # defines a scheme for the spout to emit a Stock.class object
+  - id: "stockAvroScheme"
+    className: "storm_hive_streaming_example.serializer.StockAvroScheme"
+
+  # adding the defined stock scheme to the multi-scheme that can be assigned to the spout
+  - id: "stockMultiScheme"
+    className: "org.apache.storm.spout.SchemeAsMultiScheme"
+    constructorArgs:
+      - ref: "stockAvroScheme"
+
+  - id: "zkHosts"
+    className: "storm.kafka.ZkHosts"
+    constructorArgs:
+      - "${hive-streaming-example.zk.hosts}"
+
+  # configuring the spout to read bytes from Kafka and emit Stock.class
+  - id: "stockSpoutConfig"
+    className: "storm.kafka.SpoutConfig"
+    constructorArgs:
+      - ref: "zkHosts"                            # brokerHosts
+      - "${hive-streaming-example.kafka.topic}"   # topic
+      - "${hive-streaming-example.kafka.zkRoot}"  # zkRoot
+      - "${hive-streaming-example.kafka.spoutId}" # id
+    properties:
+      - name: "scheme"
+        ref: "stockMultiScheme"                   # use the stock scheme previously defined
+
+  # partition field used for storing stocks in Hive
+  - id: "stockPartitionFields"
+    className: "org.apache.storm.tuple.Fields"
+    constructorArgs:
+      - ["name"]
+
+  # column fields of the Hive table, should match names of tuple fields
+  - id: "stockColumnFields"
+    className: "org.apache.storm.tuple.Fields"
+    constructorArgs:
+      - ["day", "open", "high", "low", "close", "volume","adj_close"]
+
+  - id: "stockDelimitedRecordHiveMapper"
+    className: "org.apache.storm.hive.bolt.mapper.DelimitedRecordHiveMapper"
+    configMethods:
+      - name: "withPartitionFields"
+        args:
+          - ref: "stockPartitionFields"
+      - name: "withColumnFields"
+        args:
+          - ref: "stockColumnFields"
+
+  - id: "stockHiveOptions"
+    className: "org.apache.storm.hive.common.HiveOptions"
+    constructorArgs:
+      - "${hive-streaming-example.hive.metaStoreURI}"   # metaStoreURI
+      - "${hive-streaming-example.hive.databaseName}"   # databaseName
+      - "${hive-streaming-exmaple.hive.tableName}"      # tableName
+      - ref: "stockDelimitedRecordHiveMapper"           # HiveMapper
+    # writes in batches of transactions -> [ batch: [(INSERT), (INSERT), ...], batch: ... ]]
+    configMethods:
+      - name: "withTxnsPerBatch" # how many transactions per batch
+        args:
+          - 2
+      - name: "withBatchSize"
+        args:
+          - 100
+      - name: "withIdleTimeout" # flush out in that time interval
+        args:
+          - 10
+
+# spout definitions
+spouts:
+  - id: "stockSpout"
+    className: "storm.kafka.KafkaSpout"
+    parallelism: 1
+    constructorArgs:
+      - ref: "stockSpoutConfig"
+
+# bolt definitions
+bolts:
+  - id: "avroStockDataBolt"
+    className: "storm_hive_streaming_example.AvroStockDataBolt"
+    parallelism: 1
+
+  - id: "fieldEmitBolt"
+    className: "storm_hive_streaming_example.FieldEmitBolt"
+    parallelism: 1
+    
+  - id: "stockHiveBolt"
+    className: "org.apache.storm.hive.bolt.HiveBolt"
+    parallelism: 1
+    constructorArgs:
+      - ref: "stockHiveOptions"
+
+#stream definitions
+streams:
+  - name: "stockSpout --> avroStockDataBolt" # name isn't used (placeholder for logging, UI, etc.)
+    from: "stockSpout"
+    to: "avroStockDataBolt"
+    grouping:
+      type: SHUFFLE
+      
+  - name: "avroStockDataBolt --> fieldEmitBolt" # name not used
+    from: "avroStockDataBolt"
+    to: "fieldEmitBolt"
+    grouping:
+      type: SHUFFLE
+
+  - name: "fieldEmitBolt --> stockHiveBolt" # name not used
+    from: "fieldEmitBolt"
+    to: "stockHiveBolt"
+    grouping:
+      type: SHUFFLE
